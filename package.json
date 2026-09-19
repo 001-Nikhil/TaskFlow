@@ -1,37 +1,44 @@
 {
-  "name": "taskflow",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "start": "node src/api.js",
-    "start:worker": "node src/worker.js",
-    "migrate:up": "node-pg-migrate up --no-single-transaction",
-    "migrate:down": "node-pg-migrate down --no-single-transaction",
-    "migrate:create": "node-pg-migrate create",
-    "test": "vitest run tests/unit",
-    "test:integration": "vitest run tests/integration --no-file-parallelism",
-    "test:chaos": "vitest run tests/chaos --no-file-parallelism",
-    "test:watch": "vitest"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "dotenv": "^18.0.1",
-    "express": "^5.2.1",
-    "express-rate-limit": "^8.7.0",
-    "ioredis": "^6.0.0",
-    "node-pg-migrate": "^9.0.0",
-    "pg": "^8.23.0",
-    "zod": "^4.6.5"
-  },
-  "devDependencies": {
-    "supertest": "^7.2.2",
-    "vitest": "^5.0.1"
-  }
+    "name": "taskflow",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+        "start": "node src/api.js",
+        "start:worker": "node src/worker.js",
+        "migrate:up": "node-pg-migrate up --no-single-transaction",
+        "migrate:down": "node-pg-migrate down --no-single-transaction",
+        "migrate:create": "node-pg-migrate create",
+        "test": "vitest run tests/unit",
+        "test:integration": "vitest run tests/integration --no-file-parallelism",
+        "test:chaos": "vitest run tests/chaos --no-file-parallelism",
+        "lint": "eslint . && prettier --check .",
+        "format": "prettier --write .",
+        "test:watch": "vitest"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "type": "commonjs",
+    "engines": {
+        "node": ">=20"
+    },
+    "dependencies": {
+        "dotenv": "^18.0.1",
+        "express": "^5.2.1",
+        "express-rate-limit": "^8.7.0",
+        "ioredis": "^6.0.0",
+        "node-pg-migrate": "^9.0.0",
+        "pg": "^8.23.0",
+        "zod": "^4.6.5"
+    },
+    "devDependencies": {
+        "@eslint/js": "^10.0.1",
+        "eslint": "^10.11.0",
+        "eslint-config-prettier": "^10.1.8",
+        "globals": "^17.12.0",
+        "prettier": "^3.9.8",
+        "supertest": "^7.2.2",
+        "vitest": "^5.0.1"
+    }
 }

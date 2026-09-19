@@ -1,7 +1,18 @@
 // Chaos tests from CLAUDE.md Section 9: kill -9, lost ack, zombie/fencing.
 // Run with: npm run test:chaos  (needs `docker compose up -d postgres redis`)
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { pool, spawnWorker, hardKill, resetDb, insertJob, getJob, events, waitFor, tmpLog, effectCount } from './helpers.js';
+import {
+    pool,
+    spawnWorker,
+    hardKill,
+    resetDb,
+    insertJob,
+    getJob,
+    events,
+    waitFor,
+    tmpLog,
+    effectCount,
+} from './helpers.js';
 import { claimNextJob, completeJob, failJob, extendLease, reapExpiredLeases } from '../../src/jobs/repository.js';
 import { once } from '../../src/jobs/effects.js';
 
@@ -55,7 +66,10 @@ describe('chaos: kill -9 mid-job', () => {
         expect(effectCount(log)).toBe(1); // crash was BEFORE the effect -> exactly one effect
 
         const trail = await events(id);
-        console.log('kill -9 event trail:\n' + trail.map((e) => `  ${e.from_status}->${e.to_status} attempt=${e.attempt} (${e.reason})`).join('\n'));
+        console.log(
+            'kill -9 event trail:\n' +
+                trail.map((e) => `  ${e.from_status}->${e.to_status} attempt=${e.attempt} (${e.reason})`).join('\n')
+        );
         expect(trail.some((e) => e.to_status === 'RETRY_SCHEDULED' && e.worker_id === victimId)).toBe(true);
         expect(trail[trail.length - 1].to_status).toBe('COMPLETED');
     }, 60000);
@@ -104,7 +118,13 @@ describe('chaos: zombie worker (fencing)', () => {
         // Zombie A wakes up holding its stale token (attempt 1).
         expect(await completeJob(pool, { jobId: id, workerId: 'zombie-A', attempt: 1 })).toEqual({ fenced: true });
         expect(
-            await failJob(pool, { jobId: id, workerId: 'zombie-A', attempt: 1, error: new Error('x'), retryable: false })
+            await failJob(pool, {
+                jobId: id,
+                workerId: 'zombie-A',
+                attempt: 1,
+                error: new Error('x'),
+                retryable: false,
+            })
         ).toEqual({ fenced: true });
         expect(await extendLease(pool, { jobId: id, workerId: 'zombie-A', attempt: 1, leaseMs: 60000 })).toBe(false);
         // The token, not the name, is what fences: right owner + stale attempt is rejected too.

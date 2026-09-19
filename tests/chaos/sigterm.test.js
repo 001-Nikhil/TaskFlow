@@ -3,8 +3,7 @@
 // Needs: `docker build -t taskflow:local .` and the compose stack running.
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
-import { pool, resetDb, insertJob, getJob, events, waitFor, tmpLog } from './helpers.js';
-import fs from 'fs';
+import { pool, resetDb, insertJob, getJob, events, waitFor } from './helpers.js';
 
 const NAME = 'taskflow_chaos_worker';
 const NETWORK = process.env.COMPOSE_NETWORK || 'task_flow_claude_default';
