@@ -11,6 +11,12 @@
 // claim survives and a redelivery will skip retrying it - we accept a
 // possible missed send over a duplicate one. If `fn` throws, the claim is
 // released so a genuine retry can attempt the effect again.
+//
+// IMPORTANT: for external effects (email, payments) this is not enough on its
+// own. Also pass the provider a stable idempotency key derived from the job
+// (e.g. `${ctx.jobId}:${effectKey}`) so the provider dedupes the residual
+// window. See docs/DESIGN.md, "External side effects need provider-level
+// idempotency keys".
 async function once(pool, jobId, effectKey, fn) {
     const claim = await pool.query(
         `INSERT INTO effects (job_id, effect_key) VALUES ($1, $2)

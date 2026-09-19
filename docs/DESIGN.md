@@ -128,6 +128,78 @@ a duplicate one for this class of failure, and documents it rather than
 claiming a stronger guarantee than the code provides. If `fn` throws, the
 claim is released so a genuine retry can attempt the effect again.
 
+### External side effects need provider-level idempotency keys
+
+`ctx.once()` deduplicates *within TaskFlow's own database*. It cannot make
+a call to an outside system exactly-once, because the claim (a Postgres
+insert) and the external call (an HTTP request to an email provider, a
+payment gateway) are two separate operations that no transaction spans.
+Two windows remain:
+
+- **Crash after the claim, before/during the call** — the claim survives, a
+  redelivery skips the call: the effect may be **missed**.
+- **Call succeeds, worker dies before the claim/ack is recorded** (or a
+  timeout makes the call *look* failed when it actually went through) — a
+  retry repeats the call: the effect may be **duplicated**.
+
+Therefore any handler that touches money, email/SMS, or other
+non-reversible external state **must pass the provider a stable
+idempotency key derived from the job**, for example `Idempotency-Key:
+<jobId>:<effectKey>` on a Stripe charge, or the message id / dedup id on
+SES/SQS. Then a repeated call is deduplicated by the provider itself, which
+is the only party that can do it atomically. `ctx.jobId` is stable across
+redeliveries for exactly this purpose. Rule of thumb: `ctx.once()` saves
+you from *most* duplicate calls and from redoing expensive work; the
+provider key is what makes the remaining window safe. The bundled
+`send_email` demo handler only prints, so it uses `ctx.once()` alone; a real
+one must do both.
+
+## Three counters, three jobs: attempt, failure_count, recovery_count
+
+`attempt` is the fencing token: it goes up on **every** claim, whatever the
+reason for the claim. It cannot double as the retry budget, because claims
+also happen for reasons that are not the job's fault: a worker was killed,
+a node was drained during a deploy, a graceful shutdown released the job.
+If `max_attempts` were compared with `attempt`, three rolling deploys could
+kill a perfectly healthy job.
+
+- `attempt` — fencing token. Never decreases (a decrease would let a
+  stale worker's old token match again).
+- `failure_count` — number of **handler failures**. The only thing
+  `max_attempts` limits. Also drives the backoff exponent.
+- `recovery_count` — number of **lease-expiry recoveries** by the reaper. It
+  does not touch the retry budget, but it has its own cap
+  (`MAX_LEASE_RECOVERIES`, default 10): a job that crashes every worker it
+  lands on (a *poison job*: e.g. it OOMs the process) would otherwise
+  crash-loop the whole fleet forever. Past the cap it goes to `DEAD` with
+  reason `poison_quarantined` so a human can look at it.
+
+Graceful-shutdown releases touch neither counter.
+
+## The reaper must re-check expiry inside its UPDATE
+
+The reaper first `SELECT`s jobs with `lease_expires_at < now()`, then
+recovers each one. Between those two steps a live worker may heartbeat and
+extend the lease. If the recovery only checked `attempt`/`locked_by` it
+would still match and steal a job from a healthy worker. So
+`recoverJob` repeats `lease_expires_at < now()` inside the guarded
+`UPDATE ... WHERE`; the heartbeat wins the race and the recovery becomes a
+no-op. The same guard makes several reapers running at once safe: only one
+can win each job. (Tested in `tests/integration/retry-budget.test.js`.)
+
+## What the worker does when the database misbehaves
+
+Three rules, each learned from a chaos test that found the opposite:
+
+1. A DB error while *recording* an outcome never crashes the process and is
+   never reported as a handler failure. The row stays `PROCESSING`; the
+   reaper recovers it after lease expiry (no retry budget spent).
+2. A severed connection on a *checked-out* client must not be an uncaught
+   exception (`pool.on('connect')` attaches a client error listener); the
+   pool-level listener only covers idle clients.
+3. If a heartbeat finds the lease gone, the handler is aborted: continuing
+   would only create side effects for a run whose result is fenced off.
+
 ## Backoff with full jitter
 
 Pure exponential backoff (`base * 2^(attempt-1)`, no randomization) means
@@ -171,15 +243,20 @@ deployment accumulates data), that would be its own migration built
 around the type-rebuild pattern, done deliberately rather than as a side
 effect of an unrelated feature.
 
-## What's not built yet (see docs/PROGRESS.md)
+## Redis today
 
-Delayed/scheduled jobs and priority queues use columns (`run_at`,
-`priority_rank`) and an index (`idx_jobs_claimable`) that already exist
-and already work — jobs with a future `run_at` are simply not claimable
-yet, and `priority_rank` already orders the claim query — but the
-*starvation-protection policy* CLAUDE.md Section 3.8 calls for (weighted
-fair polling or aging) is not implemented: right now it is strict
-priority, which can starve LOW jobs under sustained HIGH load. The API
-does not yet expose `priority`/`delayMs`/`runAt` as user-facing fields
-either. DLQ redrive/purge endpoints, the dashboard, `/metrics`, and the
-chaos test suite are also not built yet.
+Redis is not used for delivery. The API uses it for one `PING` in `/ready`
+(reported as `degraded`, never as "not ready"); nothing else reads or writes
+it. It is kept, with AOF on, as the planned home for a wake-up signal,
+rate-limit counters, and the `QueueDriver` seam for Kafka. Until one of those
+exists it is an honest cost with no benefit; removing it from compose is a
+valid simplification (see docs/AUDIT.md, "Remaining").
+
+## What's not built yet (see docs/PROGRESS.md and manual_work.md)
+
+Priority *starvation protection* (weighted polling or aging) is not
+implemented: ordering is strict priority, so sustained HIGH load can starve
+LOW. The API does not yet expose `priority`/`delayMs`/`runAt`. DLQ
+redrive/purge, list/cancel endpoints, the dashboard UI, `/metrics`,
+Grafana, tracing, and load tests are not built. The full, prioritised list
+with acceptance criteria is the top section of `manual_work.md`.
