@@ -9,9 +9,18 @@ const NAME = 'taskflow_chaos_worker';
 const NETWORK = process.env.COMPOSE_NETWORK || 'task_flow_claude_default';
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8' }).trim();
 
+// The container reaches Postgres by its compose service name, but must still
+// use the *test* database credentials/name from TEST_DATABASE_URL.
+function containerDbUrl() {
+    const url = new URL(process.env.TEST_DATABASE_URL);
+    url.hostname = 'postgres';
+    url.port = '5432';
+    return url.toString();
+}
+
 function startWorkerContainer(extraEnv = {}) {
     const env = {
-        DATABASE_URL: `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@postgres:5432/${process.env.POSTGRES_DB}`,
+        DATABASE_URL: containerDbUrl(),
         REDIS_URL: 'redis://redis:6379',
         API_KEY: process.env.API_KEY,
         TASKFLOW_ENABLE_TEST_HANDLERS: '1',
