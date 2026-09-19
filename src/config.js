@@ -12,4 +12,5 @@ module.exports = {
     databaseUrl: required('DATABASE_URL'),
     redisUrl: required('REDIS_URL'),
     port: parseInt(process.env.PORT || '3000', 10),
+    apiKey: required('API_KEY'),
 };
