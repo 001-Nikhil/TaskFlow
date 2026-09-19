@@ -1,6 +1,9 @@
 const express = require('express');
+const { installProcessGuards } = require('./processGuards');
 const db = require('./db');
 const redis = require('./redis');
+
+installProcessGuards();
 
 const app = express();
 app.use(express.json());
