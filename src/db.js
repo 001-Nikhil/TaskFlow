@@ -1,8 +1,8 @@
 const {Pool} = require('pg');
+const config = require('./config');
 
 const pool = new Pool ({
-    connectionString:
-    process.env.DATABASE_URL || 'postgres://taskflow_user:taskflow_password@localhost:5432/taskflow_db',
+    connectionString: config.databaseUrl,
     max: 10,
 });
 
