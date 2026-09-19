@@ -1,6 +1,9 @@
+const { installProcessGuards } = require('./processGuards');
 const db = require('./db');
 const redis = require('./redis');
 const crypto = require('crypto');
+
+installProcessGuards();
 
 // Generate a unique Id for this worker process instance 
 const WORKER_ID = `worker:${process.pid}:${crypto.randomBytes(4).toString('hex')}`;
