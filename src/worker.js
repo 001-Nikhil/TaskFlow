@@ -2,7 +2,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { installProcessGuards } = require('./processGuards');
 const pool = require('./db');
-const { claimNextJob, extendLease, completeJob, failJob, reapExpiredLeases } = require('./jobs/repository');
+const { claimNextJob, extendLease, completeJob, failJob, releaseJob, reapExpiredLeases } = require('./jobs/repository');
 const { registerWorker, heartbeatWorker, deregisterWorker, markDeadWorkers } = require('./jobs/workerRegistry');
 const { once } = require('./jobs/effects');
 const { NonRetryableError } = require('./jobs/errors');
@@ -45,10 +45,14 @@ const inFlight = new Set();
 // registry's current_job_id column (a liveness/dashboard hint - the reaper
 // depends only on each job's own lease_expires_at, never on this).
 const activeJobIds = new Set();
+// jobId -> { job, controller } for jobs running right now, so shutdown can
+// release + abort whatever is still running when the grace period ends.
+const running = new Map();
 
 async function processJob(job) {
     activeJobIds.add(job.id);
     const controller = new AbortController();
+    running.set(job.id, { job, controller });
     const timeoutMs = job.timeout_ms;
     const timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
     // Extends the job's DB lease well inside the lease window so a
@@ -112,6 +116,7 @@ async function processJob(job) {
         clearTimeout(timeoutTimer);
         clearInterval(leaseTimer);
         activeJobIds.delete(job.id);
+        running.delete(job.id);
     }
 }
 
@@ -165,8 +170,25 @@ async function shutdown(signal, reaperInterval, heartbeatInterval, lanes) {
     const grace = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS));
     await Promise.race([Promise.all(lanes), grace]);
 
-    if (inFlight.size > 0) {
-        console.warn(`[${WORKER_ID}] Grace period elapsed with ${inFlight.size} job(s) still in flight; exiting anyway. Their leases will expire and the reaper will retry them.`);
+    if (running.size > 0) {
+        console.warn(`[${WORKER_ID}] Grace period elapsed with ${running.size} job(s) still running; releasing them back to the queue.`);
+        // Release BEFORE aborting: abort makes processJob take its failure
+        // path, and once the row is no longer ours that path is fenced off
+        // instead of also scheduling a (backoff-delayed) retry.
+        for (const { job, controller } of running.values()) {
+            try {
+                const outcome = await releaseJob(pool, {
+                    jobId: job.id,
+                    workerId: WORKER_ID,
+                    attempt: job.attempt,
+                    reason: 'shutdown',
+                });
+                console.log(`[${WORKER_ID}] Released job ${job.id} (reason=shutdown, fenced=${outcome.fenced})`);
+            } catch (err) {
+                console.error(`[${WORKER_ID}] failed to release job ${job.id}; its lease will expire instead:`, err);
+            }
+            controller.abort();
+        }
     }
 
     try {

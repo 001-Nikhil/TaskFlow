@@ -117,16 +117,29 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok' });
 });
 
+// ioredis queues commands while disconnected and retries forever, so
+// redis.ping() against a dead Redis never settles. A readiness probe must
+// answer "not ready" promptly instead of hanging, so every dependency check
+// is bounded.
+const READY_TIMEOUT_MS = 2000;
+function withTimeout(promise, ms) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 app.get('/ready', async (req, res) => {
     const checks = { postgres: false, redis: false };
     try {
-        await pool.query('SELECT 1');
+        await withTimeout(pool.query('SELECT 1'), READY_TIMEOUT_MS);
         checks.postgres = true;
     } catch (err) {
         console.error('readiness: postgres check failed', err);
     }
     try {
-        checks.redis = (await redis.ping()) === 'PONG';
+        checks.redis = (await withTimeout(redis.ping(), READY_TIMEOUT_MS)) === 'PONG';
     } catch (err) {
         console.error('readiness: redis check failed', err);
     }

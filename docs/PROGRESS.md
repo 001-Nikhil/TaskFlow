@@ -77,3 +77,30 @@ chaos/load-test suite.
 See `docs/DESIGN.md` for the reasoning behind each completed piece, and
 `docs/AUDIT.md` for the full original findings and fix plan this log is
 tracking against.
+
+## Phase 3, item 1: chaos tests (done)
+
+`npm run test:chaos` (8 tests, real Postgres, real worker processes, real
+containers for SIGTERM). All passing:
+
+- kill -9 mid-job -> reaper reclaims, completes on attempt 2, effect once.
+- Lost ack (killed after effect, before COMPLETED) -> redelivered, effect
+  NOT repeated (effects ledger).
+- Zombie worker with stale attempt -> complete/fail/extendLease all fenced.
+- SIGTERM mid-job (worker in a container, `docker stop`) -> job completes,
+  exit 0, worker STOPPED.
+- SIGTERM with grace shorter than job -> job released as RETRY_SCHEDULED
+  (reason=shutdown) immediately.
+- Redis FLUSHALL and full Redis stop -> jobs still accepted and processed.
+
+Bugs the tests found and fixed:
+- Worker exited on grace expiry without releasing the in-flight job (job sat
+  PROCESSING until lease expiry). Added `releaseJob` (CLAUDE.md 3.12).
+- `/ready` hung forever when Redis was down (ioredis queues commands while
+  disconnected). Dependency checks now time out after 2s and report 503.
+
+Notes: the `chaos_effect` handler exists only when
+`TASKFLOW_ENABLE_TEST_HANDLERS=1`. Chaos tests wipe jobs/effects/workers in
+the dev DB, like the existing integration test. A shutdown release still
+consumes an attempt number (attempt is the fencing token and can't go down).
+Not covered yet: Postgres connection drop mid-job (chaos #4).
