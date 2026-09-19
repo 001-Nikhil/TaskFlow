@@ -1,35 +1,124 @@
-services:
-    postgres:
-        image: postgres:16-alpine
-        container_name: taskflow_postgres
-        environment:
-            POSTGRES_USER: ${POSTGRES_USER:-taskflow_user}
-            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
-            POSTGRES_DB: ${POSTGRES_DB:-taskflow_db}
-        ports:
-            - '5432:5432'
-        volumes:
-            - pgdata:/var/lib/postgresql/data
-        healthcheck:
-            test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-taskflow_user} -d ${POSTGRES_DB:-taskflow_db}']
-            interval: 5s
-            timeout: 5s
-            retries: 5
+# Whole system: `docker compose up --build`
+# Scale workers:  `docker compose up -d --build --scale worker=3`
+# Secrets come ONLY from .env (see .env.example); nothing secret has a default here.
 
-    redis:
-        image: redis:7-alpine
-        container_name: taskflow_redis
-        command: ['redis-server', '--appendonly', 'yes']
-        ports:
-            - '6379:6379'
-        volumes:
-            - redisdata:/data
-        healthcheck:
-            test: ['CMD', 'redis-cli', 'ping']
-            interval: 5s
-            timeout: 5s
-            retries: 5
+x-app-env: &app-env
+  # Built from the same POSTGRES_* values that configure the database container,
+  # so the two can never drift. (A password with URL-special characters must be
+  # percent-encoded in .env's DATABASE_URL form; keep it alphanumeric for compose.)
+  DATABASE_URL: postgres://${POSTGRES_USER:-taskflow_user}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-taskflow_db}
+  REDIS_URL: redis://redis:6379
+
+x-app-hardening: &app-hardening
+  # Unprivileged user is set in the Dockerfile; also drop everything Linux lets a
+  # container do that a Node process never needs.
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: taskflow_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskflow_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-taskflow_db}
+    ports:
+      # Loopback only: for psql / the host-run test suite, never the network.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-taskflow_user} -d ${POSTGRES_DB:-taskflow_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: taskflow_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # One-shot: applies pending migrations, then exits 0. api and worker wait for it.
+  migrate:
+    build: .
+    image: taskflow:local
+    command: ["npx", "node-pg-migrate", "up", "--no-single-transaction"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: taskflow:local
+    command: ["node", "src/api.js"]
+    environment:
+      <<: *app-env
+      API_KEY: ${API_KEY:?Set API_KEY in .env (see .env.example)}
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /ready = Postgres reachable (Redis outage only marks it degraded).
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # API drains for up to 10s (see src/api.js); leave headroom before SIGKILL.
+    stop_grace_period: 15s
+    restart: unless-stopped
+    <<: *app-hardening
+
+  worker:
+    image: taskflow:local
+    command: ["node", "src/worker.js"]
+    environment:
+      <<: *app-env
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      LEASE_MS: ${LEASE_MS:-30000}
+      HEARTBEAT_INTERVAL_MS: ${HEARTBEAT_INTERVAL_MS:-10000}
+      REAP_INTERVAL_MS: ${REAP_INTERVAL_MS:-5000}
+      # In-flight jobs get this long to finish on SIGTERM...
+      SHUTDOWN_GRACE_MS: ${SHUTDOWN_GRACE_MS:-25000}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Passes only if THIS container's worker row has a fresh heartbeat in Postgres.
+      test: ["CMD", "node", "src/workerHealthcheck.js"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    # ...and Docker must wait LONGER than that before SIGKILL (CLAUDE.md 3.12):
+    # SHUTDOWN_GRACE_MS (25s) < stop_grace_period (35s).
+    stop_grace_period: 35s
+    restart: unless-stopped
+    # No container_name / host ports: keeps `--scale worker=N` possible.
+    <<: *app-hardening
 
 volumes:
-    pgdata:
-    redisdata:
+  pgdata:
+  redisdata:
