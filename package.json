@@ -13,7 +13,7 @@
         "test:integration": "vitest run tests/integration --no-file-parallelism",
         "test:chaos": "vitest run tests/chaos --no-file-parallelism",
         "test:db:setup": "node scripts/setup-test-db.js",
-    "lint": "eslint . && prettier --check .",
+        "lint": "eslint . && prettier --check .",
         "format": "prettier --write .",
         "test:watch": "vitest"
     },
