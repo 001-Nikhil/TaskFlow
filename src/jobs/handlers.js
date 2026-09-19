@@ -18,6 +18,23 @@ const handlers = {
     },
 };
 
+// Chaos-test handler, registered only when TASKFLOW_ENABLE_TEST_HANDLERS=1 so
+// it can never be submitted to a production API. It sleeps, applies one
+// "external" side effect (an appended line in payload.logFile, guarded by
+// ctx.once), then sleeps again - giving tests a window before and after the
+// effect in which to kill the worker. The log file is the ground truth for
+// "how many times did the side effect really happen".
+if (process.env.TASKFLOW_ENABLE_TEST_HANDLERS === '1') {
+    const fs = require('fs');
+    handlers.chaos_effect = async (payload, ctx) => {
+        await ctx.sleep(payload.beforeMs || 0);
+        await ctx.once('effect', async () => {
+            fs.appendFileSync(payload.logFile, `${ctx.jobId} attempt=${ctx.attempt}\n`);
+        });
+        await ctx.sleep(payload.afterMs || 0);
+    };
+}
+
 const KNOWN_JOB_TYPES = Object.keys(handlers);
 
 module.exports = { handlers, KNOWN_JOB_TYPES };

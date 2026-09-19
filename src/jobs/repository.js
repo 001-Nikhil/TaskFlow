@@ -197,6 +197,47 @@ async function failJob(pool, { jobId, workerId, attempt, error, retryable, rando
     }
 }
 
+// Graceful-shutdown release (CLAUDE.md 3.12): hands a job this worker still
+// holds straight back to the queue, due immediately, instead of leaving it
+// PROCESSING until the lease expires (which could be a full LEASE_MS of
+// dead time). Fencing-guarded like every other transition. It never
+// dead-letters: being interrupted by a deploy is not the job's fault. Note
+// the claim already consumed an attempt number; that cannot be handed back
+// because attempt is the fencing token and must never decrease.
+async function releaseJob(pool, { jobId, workerId, attempt, reason }) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const result = await client.query(
+            `UPDATE jobs
+             SET status = 'RETRY_SCHEDULED', run_at = now(), updated_at = now(),
+                 locked_by = NULL, lease_expires_at = NULL
+             WHERE id = $1 AND status = 'PROCESSING' AND locked_by = $2 AND attempt = $3
+             RETURNING id`,
+            [jobId, workerId, attempt]
+        );
+        if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return { fenced: true };
+        }
+        await recordEvent(client, {
+            jobId,
+            fromStatus: 'PROCESSING',
+            toStatus: 'RETRY_SCHEDULED',
+            workerId,
+            attempt,
+            reason,
+        });
+        await client.query('COMMIT');
+        return { fenced: false };
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
 // Reaper: reclaims PROCESSING jobs whose lease expired (worker crashed,
 // was killed, or paused past its lease) by routing them through the same
 // retry-or-dead decision as a normal failure. Uses database time
@@ -239,6 +280,7 @@ module.exports = {
     extendLease,
     completeJob,
     failJob,
+    releaseJob,
     reapExpiredLeases,
     recordEvent,
 };

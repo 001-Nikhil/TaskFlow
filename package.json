@@ -10,7 +10,8 @@
     "migrate:down": "node-pg-migrate down --no-single-transaction",
     "migrate:create": "node-pg-migrate create",
     "test": "vitest run tests/unit",
-    "test:integration": "vitest run tests/integration",
+    "test:integration": "vitest run tests/integration --no-file-parallelism",
+    "test:chaos": "vitest run tests/chaos --no-file-parallelism",
     "test:watch": "vitest"
   },
   "keywords": [],
