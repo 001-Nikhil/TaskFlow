@@ -104,3 +104,19 @@ Notes: the `chaos_effect` handler exists only when
 the dev DB, like the existing integration test. A shutdown release still
 consumes an attempt number (attempt is the fencing token and can't go down).
 Not covered yet: Postgres connection drop mid-job (chaos #4).
+
+## Verification & cleanup pass (2026-09-20)
+
+Full-repo review against CLAUDE.md Section 3, with real runs. Results,
+commit refs and everything still open are in `docs/AUDIT.md`. Headline
+fixes: backoff was 1000x too short; DB connection drop on a checked-out
+client crashed worker/API; retry budget separated from the fencing counter
+(`failure_count`/`recovery_count`); reaper can no longer steal a live lease;
+worker survives DB errors and aborts on lease loss; API hardening; tests moved
+to `taskflow_test`; API + worker containerised in compose; ESLint/Prettier.
+Counts at the end of the pass: unit 5, integration 22, chaos 12, all passing.
+
+Checklist changes vs the earlier "not started" list: chaos tests DONE
+(all six scenarios), containerisation DONE, ESLint/Prettier DONE. Still not
+started: README, /metrics + Grafana, DLQ/list/cancel API, delayed/priority
+API fields, starvation policy, dashboard UI, k6 load tests, CI.
