@@ -491,7 +491,7 @@ P0 first. Do not skip ahead; later items assume earlier ones.
   - Why it matters: it is the first (often only) thing a reviewer reads.
   - What to do: CLAUDE writes the structure: what it is, Mermaid architecture + sequence diagram (claim/lease/fence/reap), key decisions, how to run, how to run tests and chaos tests, trade-offs and limitations. YOU rewrite the intro and "what I learned" in your own words.
   - Done when: a stranger can run `docker compose up --build`, submit a job and run the tests from the README alone; the intro is your own writing.
-  - Status: TODO (no `README.md`)
+  - Status: IN PROGRESS (README.md written 2026-09-20 with diagrams, decisions, run/test instructions, limitations; you still need to rewrite the intro in your own words, marked with a TODO comment)
 
 - **R-54 — `docs/DESIGN.md` with trade-offs**
   - Owner: CLAUDE
