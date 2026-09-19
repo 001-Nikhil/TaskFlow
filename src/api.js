@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const { rateLimit } = require('express-rate-limit');
 const { z } = require('zod');
@@ -10,6 +11,47 @@ const { KNOWN_JOB_TYPES } = require('./jobs/handlers');
 installProcessGuards();
 
 const app = express();
+
+// Probes are registered BEFORE the rate limiter: an orchestrator or load
+// balancer polling /health from one IP must never be throttled into looking
+// unhealthy.
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
+});
+
+// ioredis queues commands while disconnected and retries forever, so
+// redis.ping() against a dead Redis never settles. A readiness probe must
+// answer promptly instead of hanging, so every dependency check is bounded.
+const READY_TIMEOUT_MS = 2000;
+function withTimeout(promise, ms) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Ready = "can serve traffic correctly". That depends on Postgres only: jobs
+// are submitted to and claimed from Postgres, so Redis being down does not
+// change correctness (docs/DESIGN.md). Failing readiness for it would make a
+// load balancer pull every healthy API instance for no reason, so Redis is
+// reported as informational (`degraded`) instead.
+app.get('/ready', async (req, res) => {
+    const checks = { postgres: false, redis: false };
+    try {
+        await withTimeout(pool.query('SELECT 1'), READY_TIMEOUT_MS);
+        checks.postgres = true;
+    } catch (err) {
+        console.error('readiness: postgres check failed:', err.message);
+    }
+    try {
+        checks.redis = (await withTimeout(redis.ping(), READY_TIMEOUT_MS)) === 'PONG';
+    } catch (err) {
+        console.error('readiness: redis check failed:', err.message);
+    }
+    const ready = checks.postgres;
+    res.status(ready ? 200 : 503).json({ ready, degraded: ready && !checks.redis, checks });
+});
 
 // 256 KB per CLAUDE.md Section 3.13. express-json's default error for an
 // oversized body is a bare "PayloadTooLargeError"; the error handler below
@@ -25,12 +67,25 @@ app.use(
     })
 );
 
+// Compare digests, not the raw strings: timingSafeEqual throws on unequal
+// lengths, and comparing fixed-length hashes also hides the key's length.
+function safeEqual(a, b) {
+    const ha = crypto.createHash('sha256').update(String(a)).digest();
+    const hb = crypto.createHash('sha256').update(String(b)).digest();
+    return crypto.timingSafeEqual(ha, hb);
+}
+
 function requireApiKey(req, res, next) {
-    if (req.get('x-api-key') !== config.apiKey) {
+    if (!safeEqual(req.get('x-api-key') || '', config.apiKey)) {
         return res.status(401).json({ error: 'Missing or invalid API key' });
     }
     next();
 }
+
+// Columns a client may see. Excludes lease/fencing internals (locked_by,
+// lease_expires_at, recovery_count) and per-job tuning knobs.
+const PUBLIC_JOB_COLUMNS = `id, type, payload, status, priority_rank, attempt, failure_count, max_attempts,
+    last_error, run_at, created_at, updated_at, started_at, completed_at`;
 
 const jobSubmissionSchema = z.object({
     type: z.string().min(1, 'type is required'),
@@ -87,8 +142,9 @@ app.post('/jobs', requireApiKey, async (req, res) => {
             status: existing.rows[0].status,
         });
     } catch (err) {
-        await client.query('ROLLBACK');
-        console.error('failed to submit job', err);
+        // If the connection itself died, ROLLBACK fails too; that must not mask the response.
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('failed to submit job', err.message);
         return res.status(500).json({ error: 'Internal server error' });
     } finally {
         client.release();
@@ -102,7 +158,7 @@ app.get('/jobs/:id', requireApiKey, async (req, res) => {
     }
 
     try {
-        const result = await pool.query('SELECT * FROM jobs WHERE id = $1', [parsedId.data]);
+        const result = await pool.query(`SELECT ${PUBLIC_JOB_COLUMNS} FROM jobs WHERE id = $1`, [parsedId.data]);
         if (result.rows.length === 0) {
             return res.status(404).json({ error: 'Job not found' });
         }
@@ -111,40 +167,6 @@ app.get('/jobs/:id', requireApiKey, async (req, res) => {
         console.error('Failed to fetch job', err);
         return res.status(500).json({ error: 'Internal server error' });
     }
-});
-
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
-});
-
-// ioredis queues commands while disconnected and retries forever, so
-// redis.ping() against a dead Redis never settles. A readiness probe must
-// answer "not ready" promptly instead of hanging, so every dependency check
-// is bounded.
-const READY_TIMEOUT_MS = 2000;
-function withTimeout(promise, ms) {
-    let timer;
-    const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-    });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-app.get('/ready', async (req, res) => {
-    const checks = { postgres: false, redis: false };
-    try {
-        await withTimeout(pool.query('SELECT 1'), READY_TIMEOUT_MS);
-        checks.postgres = true;
-    } catch (err) {
-        console.error('readiness: postgres check failed', err);
-    }
-    try {
-        checks.redis = (await withTimeout(redis.ping(), READY_TIMEOUT_MS)) === 'PONG';
-    } catch (err) {
-        console.error('readiness: redis check failed', err);
-    }
-    const ready = checks.postgres && checks.redis;
-    res.status(ready ? 200 : 503).json({ ready, checks });
 });
 
 // Reshapes express's built-in JSON body-parser errors (malformed JSON,
@@ -158,6 +180,17 @@ app.use((err, req, res, next) => {
         return res.status(400).json({ error: 'Malformed JSON body' });
     }
     next(err);
+});
+
+app.use((req, res) => {
+    res.status(404).json({ error: 'Not found' });
+});
+
+// Last resort: never leak an HTML error page or stack trace to a client.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    console.error('unhandled request error', err);
+    res.status(500).json({ error: 'Internal server error' });
 });
 
 function start() {

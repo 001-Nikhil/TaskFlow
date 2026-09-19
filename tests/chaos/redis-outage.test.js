@@ -35,6 +35,21 @@ afterAll(async () => {
 });
 
 describe('chaos: Redis flush / outage', () => {
+    it('jobs already QUEUED survive FLUSHALL and are processed afterwards (no reconciler needed: Postgres is the queue)', async () => {
+        const ids = [];
+        for (let i = 0; i < 5; i++) {
+            const res = await submit(); // no worker running yet: all five sit QUEUED
+            expect(res.status).toBe(202);
+            ids.push(res.body.jobId);
+        }
+        await redis.flushall();
+        expect(await redis.dbsize()).toBe(0);
+        worker = spawnWorker();
+        for (const id of ids) {
+            await waitFor(async () => (await getJob(id)).status === 'COMPLETED', { label: 'queued job after flush' });
+        }
+    }, 60000);
+
     it('FLUSHALL loses nothing: jobs are still accepted and processed', async () => {
         worker = spawnWorker();
         await redis.flushall();
@@ -45,7 +60,7 @@ describe('chaos: Redis flush / outage', () => {
         });
     }, 30000);
 
-    it('Redis fully stopped: API still accepts jobs, worker still completes them, /ready reports the outage', async () => {
+    it('Redis fully stopped: API still accepts jobs, worker still completes them, /ready reports degraded (not down)', async () => {
         docker('stop', 'taskflow_redis');
         try {
             const res = await submit();
@@ -56,9 +71,10 @@ describe('chaos: Redis flush / outage', () => {
 
             const ready = await request(app).get('/ready');
             console.log('/ready during outage:', ready.status, JSON.stringify(ready.body));
-            expect(ready.status).toBe(503); // honest: dependency is down...
+            expect(ready.status).toBe(200); // Redis is off the correctness path: still ready...
+            expect(ready.body).toMatchObject({ ready: true, degraded: true, checks: { postgres: true, redis: false } }); // ...but honestly reported
             const health = await request(app).get('/health');
-            expect(health.status).toBe(200); // ...but the process is alive
+            expect(health.status).toBe(200);
         } finally {
             docker('start', 'taskflow_redis');
         }
