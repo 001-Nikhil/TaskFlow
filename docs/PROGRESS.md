@@ -37,14 +37,21 @@ session (user confirmed starting fresh).
       actual Linux container (Windows can't deliver real SIGTERM to test
       it directly).
 
-**Not started yet** (still to do, in the order planned):
-
-- [ ] API rewrite: idempotent submission (`INSERT ... ON CONFLICT`),
+- [x] API rewrite: idempotent submission (`INSERT ... ON CONFLICT`),
       zod validation, unknown-type rejection using
       `src/jobs/handlers.js`'s `KNOWN_JOB_TYPES`, UUID param validation,
       consistent response shape, `/health` + `/ready`, API key auth,
       payload size limit, rate limiting, graceful shutdown for the API
-      process itself (Audit #1, #2, #9–#15, #17).
+      process itself (Audit #1, #2, #9–#15, #17). Verified with an
+      integration test against the live dev stack: 10 concurrent
+      identical submissions produce exactly 1 job (5 tests, all passing).
+
+This closes every CRITICAL and HIGH item from `docs/AUDIT.md`. What's
+left is mostly net-new Phase 3 feature work plus the automated
+chaos/load-test suite.
+
+**Not started yet** (still to do, in the order planned):
+
 - [ ] DLQ inspect/redrive/purge endpoints.
 - [ ] Delayed/scheduled job support exposed at the API (`delayMs`/`runAt`
       already work at the DB/claim level — see docs/DESIGN.md).
