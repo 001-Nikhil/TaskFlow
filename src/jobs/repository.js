@@ -6,6 +6,11 @@ const { computeBackoffMs } = require('./backoff');
 // AND attempt = ...` (the fencing token) so a worker whose lease already
 // expired - and who might still be running the old handler - cannot
 // clobber whatever happened to the job since (CLAUDE.md Section 3.4).
+//
+// Three counters, three jobs (see migration add-failure-and-recovery-counters):
+//   attempt        fencing token, +1 on every claim
+//   failure_count  handler failures; the only thing max_attempts limits
+//   recovery_count lease-expiry recoveries; capped separately (poison jobs)
 
 async function recordEvent(client, { jobId, fromStatus, toStatus, workerId, attempt, reason }) {
     await client.query(
@@ -75,7 +80,8 @@ async function claimNextJob(pool, { workerId, leaseMs }) {
 
 // Extends the lease of a job this worker still holds (heartbeat). Guarded
 // by attempt so a worker that lost its lease (reaper already reclaimed the
-// job) cannot resurrect its hold on it.
+// job) cannot resurrect its hold on it. A `false` return means "you no
+// longer own this job": the worker must stop working on it.
 async function extendLease(pool, { jobId, workerId, attempt, leaseMs }) {
     const result = await pool.query(
         `UPDATE jobs
@@ -124,16 +130,18 @@ async function completeJob(pool, { jobId, workerId, attempt }) {
     }
 }
 
-// Handles a handler failure: reads the job's own retry policy under
-// FOR UPDATE (still fencing-guarded), then either schedules a backoff
-// retry or moves the job straight to DEAD (non-retryable error, or
-// attempts exhausted).
+// Handles a HANDLER failure: reads the job's own retry policy under
+// FOR UPDATE (still fencing-guarded), then either schedules a backoff retry
+// or moves the job straight to DEAD (non-retryable error, or failure budget
+// exhausted). failure_count - not attempt - is what max_attempts limits:
+// attempt is the fencing token and also rises on crashes/shutdowns, which
+// must not use up the job's retry budget.
 async function failJob(pool, { jobId, workerId, attempt, error, retryable, random }) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const current = await client.query(
-            `SELECT max_attempts, backoff_base_ms, backoff_max_ms
+            `SELECT max_attempts, failure_count, backoff_base_ms, backoff_max_ms
              FROM jobs
              WHERE id = $1 AND status = 'PROCESSING' AND locked_by = $2 AND attempt = $3
              FOR UPDATE`,
@@ -145,18 +153,19 @@ async function failJob(pool, { jobId, workerId, attempt, error, retryable, rando
             return { fenced: true };
         }
 
-        const { max_attempts: maxAttempts, backoff_base_ms: baseMs, backoff_max_ms: maxMs } = current.rows[0];
+        const row = current.rows[0];
+        const failures = row.failure_count + 1;
         const errorMessage = String(error && error.message ? error.message : error).slice(0, 2000);
-        const exhausted = attempt >= maxAttempts;
+        const exhausted = failures >= row.max_attempts;
 
         if (!retryable || exhausted) {
             const result = await client.query(
                 `UPDATE jobs
-                 SET status = 'DEAD', last_error = $4, updated_at = now(),
+                 SET status = 'DEAD', last_error = $4, failure_count = $5, updated_at = now(),
                      locked_by = NULL, lease_expires_at = NULL
                  WHERE id = $1 AND status = 'PROCESSING' AND locked_by = $2 AND attempt = $3
                  RETURNING *`,
-                [jobId, workerId, attempt, errorMessage]
+                [jobId, workerId, attempt, errorMessage, failures]
             );
             await recordEvent(client, {
                 jobId,
@@ -164,20 +173,25 @@ async function failJob(pool, { jobId, workerId, attempt, error, retryable, rando
                 toStatus: 'DEAD',
                 workerId,
                 attempt,
-                reason: exhausted ? 'attempts_exhausted' : 'non_retryable_error',
+                reason: retryable ? 'attempts_exhausted' : 'non_retryable_error',
             });
             await client.query('COMMIT');
             return { fenced: false, job: result.rows[0], deadLettered: true };
         }
 
-        const delayMs = computeBackoffMs({ attempt, baseMs, maxMs, random });
+        const delayMs = computeBackoffMs({
+            attempt: failures,
+            baseMs: row.backoff_base_ms,
+            maxMs: row.backoff_max_ms,
+            random,
+        });
         const result = await client.query(
             `UPDATE jobs
              SET status = 'RETRY_SCHEDULED', run_at = now() + make_interval(secs => $4::float / 1000),
-                 last_error = $5, updated_at = now(), locked_by = NULL, lease_expires_at = NULL
+                 last_error = $5, failure_count = $6, updated_at = now(), locked_by = NULL, lease_expires_at = NULL
              WHERE id = $1 AND status = 'PROCESSING' AND locked_by = $2 AND attempt = $3
              RETURNING *`,
-            [jobId, workerId, attempt, delayMs / 1000, errorMessage]
+            [jobId, workerId, attempt, delayMs, errorMessage, failures]
         );
         await recordEvent(client, {
             jobId,
@@ -199,11 +213,9 @@ async function failJob(pool, { jobId, workerId, attempt, error, retryable, rando
 
 // Graceful-shutdown release (CLAUDE.md 3.12): hands a job this worker still
 // holds straight back to the queue, due immediately, instead of leaving it
-// PROCESSING until the lease expires (which could be a full LEASE_MS of
-// dead time). Fencing-guarded like every other transition. It never
-// dead-letters: being interrupted by a deploy is not the job's fault. Note
-// the claim already consumed an attempt number; that cannot be handed back
-// because attempt is the fencing token and must never decrease.
+// PROCESSING until the lease expires. Fencing-guarded like every other
+// transition. Touches neither failure_count nor recovery_count: being
+// interrupted by a deploy is not the job's fault.
 async function releaseJob(pool, { jobId, workerId, attempt, reason }) {
     const client = await pool.connect();
     try {
@@ -238,35 +250,91 @@ async function releaseJob(pool, { jobId, workerId, attempt, reason }) {
     }
 }
 
-// Reaper: reclaims PROCESSING jobs whose lease expired (worker crashed,
-// was killed, or paused past its lease) by routing them through the same
-// retry-or-dead decision as a normal failure. Uses database time
-// (lease_expires_at < now()) exclusively - never a worker's clock.
-async function reapExpiredLeases(pool, { random } = {}) {
+// Lease-expiry recovery (used by the reaper). The worker did not fail - it
+// vanished - so this does NOT touch failure_count: the job goes straight
+// back to the queue, due now. recovery_count has its own cap so a job that
+// kills every worker it touches is quarantined (DEAD) rather than looping
+// forever. The guard re-checks lease_expires_at < now() *inside* the UPDATE:
+// the reaper's earlier SELECT may be stale, and a worker heartbeat that
+// extended the lease in between must win.
+async function recoverJob(pool, { jobId, workerId, attempt, maxRecoveries }) {
     const client = await pool.connect();
-    let expired;
     try {
-        const result = await client.query(
-            `SELECT id, locked_by, attempt
+        await client.query('BEGIN');
+        const current = await client.query(
+            `SELECT recovery_count
              FROM jobs
-             WHERE status = 'PROCESSING' AND lease_expires_at < now()
-             FOR UPDATE SKIP LOCKED
-             LIMIT 100`
+             WHERE id = $1 AND status = 'PROCESSING' AND locked_by = $2 AND attempt = $3
+               AND lease_expires_at < now()
+             FOR UPDATE`,
+            [jobId, workerId, attempt]
         );
-        expired = result.rows;
+        if (current.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return { fenced: true };
+        }
+
+        const recoveries = current.rows[0].recovery_count + 1;
+        const quarantine = recoveries > maxRecoveries;
+        const result = await client.query(
+            `UPDATE jobs
+             SET status = $2,
+                 run_at = now(),
+                 recovery_count = $3,
+                 last_error = $4,
+                 updated_at = now(),
+                 locked_by = NULL,
+                 lease_expires_at = NULL
+             WHERE id = $1
+             RETURNING *`,
+            [
+                jobId,
+                quarantine ? 'DEAD' : 'RETRY_SCHEDULED',
+                recoveries,
+                quarantine
+                    ? `poison job quarantined: lease expired ${recoveries} times (worker crash loop?)`
+                    : 'lease expired: worker did not complete or heartbeat in time',
+            ]
+        );
+        await recordEvent(client, {
+            jobId,
+            fromStatus: 'PROCESSING',
+            toStatus: quarantine ? 'DEAD' : 'RETRY_SCHEDULED',
+            workerId,
+            attempt,
+            reason: quarantine ? 'poison_quarantined' : 'lease_expired_recovered',
+        });
+        await client.query('COMMIT');
+        return { fenced: false, job: result.rows[0], deadLettered: quarantine };
+    } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
     } finally {
         client.release();
     }
+}
+
+// Reaper: finds PROCESSING jobs whose lease expired (worker crashed, was
+// killed, or paused past its lease) and recovers each one. Uses database
+// time (lease_expires_at < now()) exclusively - never a worker's clock. No
+// row locks are needed on the scan: recoverJob's guarded UPDATE is what
+// makes several concurrent reapers safe (only one can win each job).
+async function reapExpiredLeases(pool, { maxRecoveries = 10 } = {}) {
+    const { rows } = await pool.query(
+        `SELECT id, locked_by, attempt
+         FROM jobs
+         WHERE status = 'PROCESSING' AND lease_expires_at < now()
+         ORDER BY lease_expires_at
+         LIMIT 100`
+    );
 
     const reaped = [];
-    for (const row of expired) {
-        const outcome = await failJob(pool, {
+    for (const row of rows) {
+        const outcome = await recoverJob(pool, {
             jobId: row.id,
             workerId: row.locked_by,
             attempt: row.attempt,
-            error: new Error('lease expired: worker did not complete or heartbeat in time'),
-            retryable: true,
-            random,
+            maxRecoveries,
         });
         if (!outcome.fenced) {
             reaped.push({ jobId: row.id, deadLettered: outcome.deadLettered });
@@ -281,6 +349,7 @@ module.exports = {
     completeJob,
     failJob,
     releaseJob,
+    recoverJob,
     reapExpiredLeases,
     recordEvent,
 };
