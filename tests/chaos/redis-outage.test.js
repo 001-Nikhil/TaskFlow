@@ -40,7 +40,9 @@ describe('chaos: Redis flush / outage', () => {
         await redis.flushall();
         const res = await submit();
         expect(res.status).toBe(202);
-        await waitFor(async () => (await getJob(res.body.jobId)).status === 'COMPLETED', { label: 'job completion after flush' });
+        await waitFor(async () => (await getJob(res.body.jobId)).status === 'COMPLETED', {
+            label: 'job completion after flush',
+        });
     }, 30000);
 
     it('Redis fully stopped: API still accepts jobs, worker still completes them, /ready reports the outage', async () => {
@@ -48,7 +50,9 @@ describe('chaos: Redis flush / outage', () => {
         try {
             const res = await submit();
             expect(res.status).toBe(202);
-            await waitFor(async () => (await getJob(res.body.jobId)).status === 'COMPLETED', { label: 'completion during outage' });
+            await waitFor(async () => (await getJob(res.body.jobId)).status === 'COMPLETED', {
+                label: 'completion during outage',
+            });
 
             const ready = await request(app).get('/ready');
             console.log('/ready during outage:', ready.status, JSON.stringify(ready.body));

@@ -32,10 +32,14 @@ function sleep(ms, signal) {
             reject(new Error('aborted'));
             return;
         }
-        signal.addEventListener('abort', () => {
-            clearTimeout(timer);
-            reject(new Error('aborted'));
-        }, { once: true });
+        signal.addEventListener(
+            'abort',
+            () => {
+                clearTimeout(timer);
+                reject(new Error('aborted'));
+            },
+            { once: true }
+        );
     });
 }
 
@@ -58,8 +62,9 @@ async function processJob(job) {
     // Extends the job's DB lease well inside the lease window so a
     // slow-but-alive handler never loses its lease to the reaper mid-run.
     const leaseTimer = setInterval(() => {
-        extendLease(pool, { jobId: job.id, workerId: WORKER_ID, attempt: job.attempt, leaseMs: LEASE_MS })
-            .catch((err) => console.error(`[${WORKER_ID}] lease extension failed for job ${job.id}:`, err));
+        extendLease(pool, { jobId: job.id, workerId: WORKER_ID, attempt: job.attempt, leaseMs: LEASE_MS }).catch(
+            (err) => console.error(`[${WORKER_ID}] lease extension failed for job ${job.id}:`, err)
+        );
     }, HEARTBEAT_INTERVAL_MS);
 
     try {
@@ -84,9 +89,13 @@ async function processJob(job) {
         await Promise.race([
             handler(job.payload, ctx),
             new Promise((_, reject) => {
-                controller.signal.addEventListener('abort', () => {
-                    reject(new Error(`Job timed out after ${timeoutMs}ms`));
-                }, { once: true });
+                controller.signal.addEventListener(
+                    'abort',
+                    () => {
+                        reject(new Error(`Job timed out after ${timeoutMs}ms`));
+                    },
+                    { once: true }
+                );
             }),
         ]);
 
@@ -106,7 +115,9 @@ async function processJob(job) {
             retryable,
         });
         if (outcome.fenced) {
-            console.warn(`[${WORKER_ID}] Failure handling for job ${job.id} rejected by fencing (lease was reclaimed).`);
+            console.warn(
+                `[${WORKER_ID}] Failure handling for job ${job.id} rejected by fencing (lease was reclaimed).`
+            );
         } else if (outcome.deadLettered) {
             console.error(`[${WORKER_ID}] Job ${job.id} moved to DEAD: ${err.message}`);
         } else {
@@ -150,7 +161,10 @@ async function reaperTick() {
     try {
         const reaped = await reapExpiredLeases(pool);
         if (reaped.length > 0) {
-            console.log(`[${WORKER_ID}] Reaper reclaimed ${reaped.length} job(s):`, reaped.map((r) => r.jobId));
+            console.log(
+                `[${WORKER_ID}] Reaper reclaimed ${reaped.length} job(s):`,
+                reaped.map((r) => r.jobId)
+            );
         }
         await markDeadWorkers(pool, { thresholdMs: DEAD_WORKER_THRESHOLD_MS });
     } catch (err) {
@@ -171,7 +185,9 @@ async function shutdown(signal, reaperInterval, heartbeatInterval, lanes) {
     await Promise.race([Promise.all(lanes), grace]);
 
     if (running.size > 0) {
-        console.warn(`[${WORKER_ID}] Grace period elapsed with ${running.size} job(s) still running; releasing them back to the queue.`);
+        console.warn(
+            `[${WORKER_ID}] Grace period elapsed with ${running.size} job(s) still running; releasing them back to the queue.`
+        );
         // Release BEFORE aborting: abort makes processJob take its failure
         // path, and once the row is no longer ours that path is fenced off
         // instead of also scheduling a (backoff-delayed) retry.

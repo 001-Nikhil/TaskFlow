@@ -23,10 +23,7 @@ async function heartbeatWorker(pool, { id, currentJobId }) {
 }
 
 async function deregisterWorker(pool, { id }) {
-    await pool.query(
-        `UPDATE workers SET status = 'STOPPED', current_job_id = NULL WHERE id = $1`,
-        [id]
-    );
+    await pool.query(`UPDATE workers SET status = 'STOPPED', current_job_id = NULL WHERE id = $1`, [id]);
 }
 
 // Marks workers dead if they haven't heartbeat within `thresholdMs`. This

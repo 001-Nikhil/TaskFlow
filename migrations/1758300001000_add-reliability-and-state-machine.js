@@ -97,18 +97,22 @@ exports.up = (pgm) => {
     // Execution-idempotency ledger: a handler calls ctx.once(effectKey, fn)
     // which inserts here in the same transaction as the side effect, so a
     // redelivered job can detect it already ran this effect.
-    pgm.createTable('effects', {
-        job_id: {
-            type: 'uuid',
-            notNull: true,
-            references: 'jobs',
-            onDelete: 'CASCADE',
+    pgm.createTable(
+        'effects',
+        {
+            job_id: {
+                type: 'uuid',
+                notNull: true,
+                references: 'jobs',
+                onDelete: 'CASCADE',
+            },
+            effect_key: { type: 'text', notNull: true },
+            created_at: { type: 'timestamptz', notNull: true, default: pgm.func('now()') },
         },
-        effect_key: { type: 'text', notNull: true },
-        created_at: { type: 'timestamptz', notNull: true, default: pgm.func('now()') },
-    }, {
-        constraints: { primaryKey: ['job_id', 'effect_key'] },
-    });
+        {
+            constraints: { primaryKey: ['job_id', 'effect_key'] },
+        }
+    );
 
     // idx_jobs_claimable (on RETRY_SCHEDULED) is added in the next migration:
     // a partial index predicate referencing a brand-new enum value cannot be

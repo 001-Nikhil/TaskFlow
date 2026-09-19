@@ -8,14 +8,7 @@
  */
 
 exports.up = (pgm) => {
-    pgm.createType('job_status', [
-        'PENDING',
-        'QUEUED',
-        'PROCESSING',
-        'COMPLETED',
-        'FAILED',
-        'DEAD',
-    ]);
+    pgm.createType('job_status', ['PENDING', 'QUEUED', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD']);
 
     pgm.createTable('jobs', {
         id: {

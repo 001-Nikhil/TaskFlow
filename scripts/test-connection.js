@@ -10,12 +10,10 @@ async function testConnections() {
 
         const redisRes = await redis.ping();
         console.log('Redis connected, ping : ', redisRes);
-    }
-    catch (err) {
+    } catch (err) {
         console.error('connection error', err);
         process.exitCode = 1;
-    }
-    finally {
+    } finally {
         await pgPool.end();
         redis.disconnect();
     }

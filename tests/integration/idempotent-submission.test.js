@@ -1,7 +1,7 @@
 // Requires a live Postgres/Redis (the docker-compose dev stack) reachable
 // via .env's DATABASE_URL/REDIS_URL - this is an integration test, not a
 // mock. Run with: npm run test:integration
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { app } from '../../src/api.js';
 import pool from '../../src/db.js';
@@ -26,10 +26,7 @@ describe('POST /jobs idempotent submission', () => {
     });
 
     it('rejects an unknown job type', async () => {
-        const res = await request(app)
-            .post('/jobs')
-            .set('x-api-key', apiKey)
-            .send({ type: 'not_a_real_type' });
+        const res = await request(app).post('/jobs').set('x-api-key', apiKey).send({ type: 'not_a_real_type' });
         expect(res.status).toBe(400);
     });
 
