@@ -12,16 +12,28 @@ installProcessGuards();
 
 const WORKER_ID = `worker:${process.pid}:${crypto.randomBytes(4).toString('hex')}`;
 
-const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || '4', 10);
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '500', 10);
-const LEASE_MS = parseInt(process.env.LEASE_MS || '30000', 10);
-const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || String(Math.floor(LEASE_MS / 3)), 10);
-const REAP_INTERVAL_MS = parseInt(process.env.REAP_INTERVAL_MS || '5000', 10);
-const SHUTDOWN_GRACE_MS = parseInt(process.env.SHUTDOWN_GRACE_MS || '25000', 10);
-const DEAD_WORKER_THRESHOLD_MS = parseInt(
-    process.env.DEAD_WORKER_THRESHOLD_MS || String(HEARTBEAT_INTERVAL_MS * 3),
-    10
-);
+function intEnv(name, fallback, { min = 1 } = {}) {
+    const raw = process.env[name];
+    const value = raw === undefined || raw === '' ? fallback : Number(raw);
+    if (!Number.isInteger(value) || value < min) {
+        throw new Error(`Invalid ${name}=${raw}: must be an integer >= ${min}`);
+    }
+    return value;
+}
+
+// Fail fast on a nonsensical configuration instead of misbehaving later.
+const CONCURRENCY = intEnv('WORKER_CONCURRENCY', 4);
+const POLL_INTERVAL_MS = intEnv('POLL_INTERVAL_MS', 500);
+const LEASE_MS = intEnv('LEASE_MS', 30000);
+const HEARTBEAT_INTERVAL_MS = intEnv('HEARTBEAT_INTERVAL_MS', Math.floor(LEASE_MS / 3));
+const REAP_INTERVAL_MS = intEnv('REAP_INTERVAL_MS', 5000);
+const SHUTDOWN_GRACE_MS = intEnv('SHUTDOWN_GRACE_MS', 25000, { min: 0 });
+const MAX_LEASE_RECOVERIES = intEnv('MAX_LEASE_RECOVERIES', 10, { min: 0 });
+const DEAD_WORKER_THRESHOLD_MS = intEnv('DEAD_WORKER_THRESHOLD_MS', HEARTBEAT_INTERVAL_MS * 3);
+if (HEARTBEAT_INTERVAL_MS * 2 > LEASE_MS) {
+    // A single missed heartbeat must not cost the worker its lease.
+    throw new Error(`HEARTBEAT_INTERVAL_MS (${HEARTBEAT_INTERVAL_MS}) must be <= LEASE_MS/2 (${LEASE_MS / 2})`);
+}
 
 function sleep(ms, signal) {
     return new Promise((resolve, reject) => {
@@ -53,75 +65,115 @@ const activeJobIds = new Set();
 // release + abort whatever is still running when the grace period ends.
 const running = new Map();
 
+// Runs the handler and reports its outcome. Never throws: every DB error on
+// the way out is contained here, because a rejection escaping into lane()
+// would hit the unhandledRejection guard and kill the whole worker over one
+// transient Postgres blip. If the outcome cannot be written, the row simply
+// stays PROCESSING and the reaper recovers it after the lease expires
+// (without spending the job's retry budget).
 async function processJob(job) {
     activeJobIds.add(job.id);
     const controller = new AbortController();
     running.set(job.id, { job, controller });
     const timeoutMs = job.timeout_ms;
     const timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
-    // Extends the job's DB lease well inside the lease window so a
-    // slow-but-alive handler never loses its lease to the reaper mid-run.
-    const leaseTimer = setInterval(() => {
-        extendLease(pool, { jobId: job.id, workerId: WORKER_ID, attempt: job.attempt, leaseMs: LEASE_MS }).catch(
-            (err) => console.error(`[${WORKER_ID}] lease extension failed for job ${job.id}:`, err)
-        );
+
+    // If a heartbeat finds we no longer own the job (the reaper reclaimed it,
+    // or an operator moved it), stop the handler: continuing would only
+    // produce side effects for a run whose result will be fenced off anyway.
+    let leaseLost = false;
+    const leaseTimer = setInterval(async () => {
+        try {
+            const owned = await extendLease(pool, {
+                jobId: job.id,
+                workerId: WORKER_ID,
+                attempt: job.attempt,
+                leaseMs: LEASE_MS,
+            });
+            if (!owned && !leaseLost) {
+                leaseLost = true;
+                console.warn(`[${WORKER_ID}] Lost lease on job ${job.id}; aborting handler.`);
+                controller.abort();
+            }
+        } catch (err) {
+            console.error(`[${WORKER_ID}] lease extension failed for job ${job.id}:`, err.message);
+        }
     }, HEARTBEAT_INTERVAL_MS);
 
     try {
-        const handler = handlers[job.type];
-        if (!handler) {
-            throw new NonRetryableError(`No handler registered for job type: ${job.type}`);
+        let handlerError = null;
+        try {
+            const handler = handlers[job.type];
+            if (!handler) {
+                throw new NonRetryableError(`No handler registered for job type: ${job.type}`);
+            }
+
+            const ctx = {
+                jobId: job.id,
+                attempt: job.attempt,
+                signal: controller.signal,
+                sleep: (ms) => sleep(ms, controller.signal),
+                once: (key, fn) => once(pool, job.id, key, fn),
+            };
+
+            // Node cannot forcibly kill a running async function; this races the
+            // handler against the abort signal so a hung handler doesn't block
+            // this lane forever. If the handler ignores the signal, its promise
+            // keeps running in the background - the lease reaper is the actual
+            // safety net for a handler that never honors cancellation.
+            await Promise.race([
+                handler(job.payload, ctx),
+                new Promise((_, reject) => {
+                    controller.signal.addEventListener(
+                        'abort',
+                        () => reject(new Error(`Job timed out after ${timeoutMs}ms`)),
+                        { once: true }
+                    );
+                }),
+            ]);
+        } catch (err) {
+            handlerError = err;
         }
 
-        const ctx = {
-            jobId: job.id,
-            attempt: job.attempt,
-            signal: controller.signal,
-            sleep: (ms) => sleep(ms, controller.signal),
-            once: (key, fn) => once(pool, job.id, key, fn),
-        };
+        if (leaseLost) return; // not ours any more; any write would be fenced
 
-        // Node cannot forcibly kill a running async function; this races the
-        // handler against the abort signal so a hung handler doesn't block
-        // this lane forever. If the handler ignores the signal, its promise
-        // keeps running in the background - the lease reaper is the actual
-        // safety net for a handler that never honors cancellation.
-        await Promise.race([
-            handler(job.payload, ctx),
-            new Promise((_, reject) => {
-                controller.signal.addEventListener(
-                    'abort',
-                    () => {
-                        reject(new Error(`Job timed out after ${timeoutMs}ms`));
-                    },
-                    { once: true }
-                );
-            }),
-        ]);
-
-        const outcome = await completeJob(pool, { jobId: job.id, workerId: WORKER_ID, attempt: job.attempt });
-        if (outcome.fenced) {
-            console.warn(`[${WORKER_ID}] Completion for job ${job.id} rejected by fencing (lease was reclaimed).`);
-        } else {
-            console.log(`[${WORKER_ID}] Job ${job.id} COMPLETED`);
-        }
-    } catch (err) {
-        const retryable = !(err instanceof NonRetryableError);
-        const outcome = await failJob(pool, {
-            jobId: job.id,
-            workerId: WORKER_ID,
-            attempt: job.attempt,
-            error: err,
-            retryable,
-        });
-        if (outcome.fenced) {
-            console.warn(
-                `[${WORKER_ID}] Failure handling for job ${job.id} rejected by fencing (lease was reclaimed).`
+        // Recording the outcome is deliberately outside the handler try/catch:
+        // a DB error while writing "completed" must not be misreported as a
+        // handler failure (which would re-run a job that actually succeeded).
+        try {
+            if (handlerError) {
+                const retryable = !(handlerError instanceof NonRetryableError);
+                const outcome = await failJob(pool, {
+                    jobId: job.id,
+                    workerId: WORKER_ID,
+                    attempt: job.attempt,
+                    error: handlerError,
+                    retryable,
+                });
+                if (outcome.fenced) {
+                    console.warn(`[${WORKER_ID}] Failure of job ${job.id} rejected by fencing (lease was reclaimed).`);
+                } else if (outcome.deadLettered) {
+                    console.error(`[${WORKER_ID}] Job ${job.id} moved to DEAD: ${handlerError.message}`);
+                } else {
+                    console.warn(
+                        `[${WORKER_ID}] Job ${job.id} scheduled for retry in ${outcome.delayMs}ms: ${handlerError.message}`
+                    );
+                }
+            } else {
+                const outcome = await completeJob(pool, { jobId: job.id, workerId: WORKER_ID, attempt: job.attempt });
+                if (outcome.fenced) {
+                    console.warn(
+                        `[${WORKER_ID}] Completion of job ${job.id} rejected by fencing (lease was reclaimed).`
+                    );
+                } else {
+                    console.log(`[${WORKER_ID}] Job ${job.id} COMPLETED`);
+                }
+            }
+        } catch (err) {
+            console.error(
+                `[${WORKER_ID}] Could not record outcome of job ${job.id} (${err.message}); ` +
+                    'it stays PROCESSING and the reaper will recover it after lease expiry.'
             );
-        } else if (outcome.deadLettered) {
-            console.error(`[${WORKER_ID}] Job ${job.id} moved to DEAD: ${err.message}`);
-        } else {
-            console.warn(`[${WORKER_ID}] Job ${job.id} scheduled for retry in ${outcome.delayMs}ms: ${err.message}`);
         }
     } finally {
         clearTimeout(timeoutTimer);
@@ -137,7 +189,7 @@ async function lane() {
         try {
             job = await claimNextJob(pool, { workerId: WORKER_ID, leaseMs: LEASE_MS });
         } catch (err) {
-            console.error(`[${WORKER_ID}] claim error:`, err);
+            console.error(`[${WORKER_ID}] claim error:`, err.message);
             await sleep(POLL_INTERVAL_MS);
             continue;
         }
@@ -159,7 +211,7 @@ async function lane() {
 
 async function reaperTick() {
     try {
-        const reaped = await reapExpiredLeases(pool);
+        const reaped = await reapExpiredLeases(pool, { maxRecoveries: MAX_LEASE_RECOVERIES });
         if (reaped.length > 0) {
             console.log(
                 `[${WORKER_ID}] Reaper reclaimed ${reaped.length} job(s):`,
@@ -168,7 +220,7 @@ async function reaperTick() {
         }
         await markDeadWorkers(pool, { thresholdMs: DEAD_WORKER_THRESHOLD_MS });
     } catch (err) {
-        console.error(`[${WORKER_ID}] reaper tick failed:`, err);
+        console.error(`[${WORKER_ID}] reaper tick failed:`, err.message);
     }
 }
 
@@ -181,8 +233,12 @@ async function shutdown(signal, reaperInterval, heartbeatInterval, lanes) {
     clearInterval(reaperInterval);
     clearInterval(heartbeatInterval);
 
-    const grace = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS));
+    let graceTimer;
+    const grace = new Promise((resolve) => {
+        graceTimer = setTimeout(resolve, SHUTDOWN_GRACE_MS);
+    });
     await Promise.race([Promise.all(lanes), grace]);
+    clearTimeout(graceTimer);
 
     if (running.size > 0) {
         console.warn(
@@ -191,7 +247,7 @@ async function shutdown(signal, reaperInterval, heartbeatInterval, lanes) {
         // Release BEFORE aborting: abort makes processJob take its failure
         // path, and once the row is no longer ours that path is fenced off
         // instead of also scheduling a (backoff-delayed) retry.
-        for (const { job, controller } of running.values()) {
+        for (const { job, controller } of [...running.values()]) {
             try {
                 const outcome = await releaseJob(pool, {
                     jobId: job.id,
@@ -230,14 +286,23 @@ async function start() {
     const heartbeatInterval = setInterval(() => {
         const currentJobId = activeJobIds.values().next().value || null;
         heartbeatWorker(pool, { id: WORKER_ID, currentJobId }).catch((err) => {
-            console.error(`[${WORKER_ID}] worker heartbeat failed:`, err);
+            console.error(`[${WORKER_ID}] worker heartbeat failed:`, err.message);
         });
     }, HEARTBEAT_INTERVAL_MS);
 
     const lanes = Array.from({ length: CONCURRENCY }, () => lane());
 
-    process.on('SIGTERM', () => shutdown('SIGTERM', reaperInterval, heartbeatInterval, lanes));
-    process.on('SIGINT', () => shutdown('SIGINT', reaperInterval, heartbeatInterval, lanes));
+    const onSignal = (signal) => {
+        shutdown(signal, reaperInterval, heartbeatInterval, lanes).catch((err) => {
+            console.error(`[${WORKER_ID}] shutdown failed:`, err);
+            process.exit(1);
+        });
+    };
+    process.on('SIGTERM', () => onSignal('SIGTERM'));
+    process.on('SIGINT', () => onSignal('SIGINT'));
 }
 
-start();
+start().catch((err) => {
+    console.error(`[${WORKER_ID}] failed to start:`, err);
+    process.exit(1);
+});
